@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, Iterable, List, Optional, Callable, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Callable, Tuple, Union, cast
 
 import requests
 
 
 Json = Dict[str, Any]
+
+# In this repo we support two server styles:
+# - Open Responses /v1/responses -> ResponseObject
+# - OpenAI-compatible /v1/chat/completions -> plain dict JSON
+ResponseLike = Union["ResponseObject", Json]
 
 
 # -----------------------------
@@ -243,6 +248,52 @@ class OpenResponsesClient:
             r.raise_for_status()
             return ResponseObject(r.json())
 
+    def create_chat(
+        self,
+        *,
+        model: str,
+        messages: List[Json],
+        tools: Optional[List[Json]] = None,
+        tool_choice: Optional[Union[str, Json]] = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> Json:
+        """Send a request to /v1/chat/completions (OpenAI-compatible).
+
+        Notes:
+        - Ollama's tool calling support is currently much more reliable on chat/completions
+          than on /v1/responses for many local models.
+        - We return raw dict JSON (not ResponseObject).
+        """
+        url = f"{self.base_url}/v1/chat/completions"
+
+        payload: Json = {
+            "model": model,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+
+        payload.update(kwargs)
+
+        # Streaming for chat/completions isn't wired into this client.
+        if stream:
+            raise NotImplementedError("Streaming chat/completions is not implemented in this client.")
+
+        r = self.session.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            stream=False,
+            timeout=self.timeout_s,
+        )
+        r.encoding = "utf-8"
+        r.raise_for_status()
+        data = r.json()
+        return cast(Json, data)
+
     @staticmethod
     def _iter_sse_events(lines: Iterable[str]) -> Generator[StreamEvent, None, None]:
         """
@@ -264,11 +315,23 @@ class OpenResponsesClient:
                     continue
 
     @staticmethod
-    def extract_text(resp: ResponseObject) -> str:
-        """
-        Helper to extract text from a non-streaming response.
-        """
-        text_parts = []
+    def extract_text(resp: ResponseLike) -> str:
+        """Extract text for either /v1/responses (ResponseObject) or chat/completions (dict)."""
+        # chat/completions
+        if isinstance(resp, dict):
+            try:
+                choices = resp.get("choices")
+                if isinstance(choices, list) and choices:
+                    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                    if isinstance(msg, dict):
+                        c = msg.get("content")
+                        return c if isinstance(c, str) else ""
+            except Exception:
+                return ""
+            return ""
+
+        # /v1/responses
+        text_parts: List[str] = []
         for item in resp.output:
             if item.get("type") == "message":
                 content = item.get("content", [])
@@ -276,8 +339,10 @@ class OpenResponsesClient:
                     text_parts.append(content)
                 elif isinstance(content, list):
                     for part in content:
-                        if part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
+                        if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                            t = part.get("text")
+                            if isinstance(t, str):
+                                text_parts.append(t)
         return "".join(text_parts)
 
     @staticmethod
@@ -290,45 +355,79 @@ class OpenResponsesClient:
         return ""
 
     @staticmethod
-    def find_tool_calls(resp: ResponseObject) -> List[ToolCall]:
+    def find_tool_calls(resp: ResponseLike) -> List[ToolCall]:
+        """Find tool calls for both /v1/responses and chat/completions.
+
+        - /v1/responses: scan resp.output items
+        - chat/completions: scan resp["choices"][0]["message"]["tool_calls"]
+
+        [Robustness]
+        - name may be missing/None on some local servers
+        - arguments may be JSON string or dict
         """
-        Find tool calls in the response output.
-        [Robustness] Includes fixes for missing 'name' fields from some Local LLMs.
-        """
+
+        def _coerce_name(x: Any) -> str:
+            if x is None:
+                return ""
+            return x if isinstance(x, str) else str(x)
+
+        def _coerce_args(x: Any) -> Json:
+            if isinstance(x, dict):
+                return cast(Json, x)
+            if x is None:
+                return {}
+            return cast(Json, _safe_json_args(x if isinstance(x, str) else str(x)))
+
         calls: List[ToolCall] = []
+
+        # chat/completions
+        if isinstance(resp, dict):
+            try:
+                choices = resp.get("choices")
+                if isinstance(choices, list) and choices:
+                    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                    if isinstance(msg, dict):
+                        tc_list = msg.get("tool_calls")
+                        if isinstance(tc_list, list):
+                            for tc in tc_list:
+                                if not isinstance(tc, dict):
+                                    continue
+                                fn = tc.get("function")
+                                if not isinstance(fn, dict):
+                                    continue
+                                name = _coerce_name(fn.get("name"))
+                                args = _coerce_args(fn.get("arguments"))
+                                call_id = tc.get("id") or tc.get("tool_call_id") or tc.get("call_id")
+                                calls.append(ToolCall(name=name, arguments=args, call_id=call_id, raw_item=tc))
+                return calls
+            except Exception:
+                # fall through to /v1/responses parsing
+                pass
+
+        # /v1/responses
+        if not isinstance(resp, ResponseObject):
+            return calls
+
         for item in resp.output:
             if not isinstance(item, dict):
                 continue
             t = item.get("type")
 
-            # Check for top-level tool_call/function_call
+            # Top-level tool_call/function_call
             if t in ("function_call", "tool_call"):
-                name = item.get("name")
-                raw_args = item.get("arguments", "{}")
+                name = _coerce_name(item.get("name"))
+                args = _coerce_args(item.get("arguments"))
                 call_id = item.get("id") or item.get("call_id") or item.get("tool_call_id")
-                args = _safe_json_args(raw_args)
-                
-                # [Robustness] Handle None name -> empty string
-                if name is None:
-                    name = ""
-                
-                if isinstance(name, str):
-                    calls.append(ToolCall(name=name, arguments=args, call_id=call_id, raw_item=item))
+                calls.append(ToolCall(name=name, arguments=args, call_id=call_id, raw_item=item))
                 continue
 
-            # Check for nested function objects
+            # Nested function object
             fn = item.get("function")
             if isinstance(fn, dict):
-                name = fn.get("name")
-                raw_args = fn.get("arguments", "{}")
+                name = _coerce_name(fn.get("name"))
+                args = _coerce_args(fn.get("arguments"))
                 call_id = item.get("id") or item.get("call_id") or item.get("tool_call_id")
-                args = _safe_json_args(raw_args)
-                
-                if name is None:
-                    name = ""
-                    
-                if isinstance(name, str):
-                    calls.append(ToolCall(name=name, arguments=args, call_id=call_id, raw_item=item))
+                calls.append(ToolCall(name=name, arguments=args, call_id=call_id, raw_item=item))
 
         return calls
 
@@ -367,72 +466,137 @@ class ToolRunner:
         max_rounds: int = 8,
         max_tool_calls: int = 8,
         tool_choice: Optional[Union[str, Json]] = "auto",
-    ) -> Tuple[ResponseObject, List[ResponseObject]]:
+        mode: str = "responses",
+    ) -> Tuple[ResponseLike, List[ResponseLike]]:
         """
         Executes the tool calling loop.
         
         Returns:
             (final_response, list_of_all_responses)
         """
-        rounds: List[ResponseObject] = []
+        rounds: List[ResponseLike] = []
 
-        # Round 1: Initial user request
-        resp = self.client.create(
-            model=model,
-            input=user_text,
-            instructions=instructions,
-            tools=tools_schema,
-            tool_choice=tool_choice,
-            max_tool_calls=max_tool_calls,
-        )
-        assert isinstance(resp, ResponseObject)
-        rounds.append(resp)
-
-        for _ in range(max_rounds):
-            calls = self.client.find_tool_calls(resp)
-            
-            # If no tools called, we are done
-            if not calls:
-                return resp, rounds
-
-            outputs: List[Json] = []
-            for call in calls:
-                target_name = call.name
-                
-                # [Robustness] If server sent empty name & we have only 1 tool, assume it's that one.
-                if not target_name and len(self.tool_impls) == 1:
-                    target_name = list(self.tool_impls.keys())[0]
-                    print(f"[ToolRunner] ⚠️ Warning: Received unnamed tool call. Auto-routing to '{target_name}'")
-
-                fn = self.tool_impls.get(target_name)
-                
-                if fn is None:
-                    tool_out = {"error": f"Tool '{target_name}' not implemented."}
-                    status = "failed"
-                else:
-                    try:
-                        # Execute the Python function
-                        tool_out = fn(call.arguments)
-                        status = "completed"
-                    except Exception as e:
-                        tool_out = {"error": str(e)}
-                        status = "failed"
-
-                # Build the output payload for the next turn
-                outputs.append({
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "status": status,
-                    "output": json.dumps(tool_out, ensure_ascii=False),
-                })
-
-            # Next round: Send tool outputs back to model
+        # -------------------------
+        # Mode A) /v1/responses loop
+        # -------------------------
+        if mode == "responses":
             resp = self.client.create(
                 model=model,
-                previous_response_id=resp.id,
-                input=outputs,
+                input=user_text,
+                instructions=instructions,
+                tools=tools_schema,
+                tool_choice=tool_choice,
+                max_tool_calls=max_tool_calls,
             )
             assert isinstance(resp, ResponseObject)
             rounds.append(resp)
 
-        return resp, rounds
+            for _ in range(max_rounds):
+                calls = self.client.find_tool_calls(resp)
+                if not calls:
+                    return resp, rounds
+
+                outputs: List[Json] = []
+                for call in calls:
+                    target_name = call.name
+
+                    # [Robustness] If server sent empty name & we have only 1 tool, assume it's that one.
+                    if not target_name and len(self.tool_impls) == 1:
+                        target_name = list(self.tool_impls.keys())[0]
+                        print(f"[ToolRunner] ⚠️ Warning: Received unnamed tool call. Auto-routing to '{target_name}'")
+
+                    fn = self.tool_impls.get(target_name)
+
+                    if fn is None:
+                        tool_out = {"error": f"Tool '{target_name}' not implemented."}
+                        status = "failed"
+                    else:
+                        try:
+                            tool_out = fn(call.arguments)
+                            status = "completed"
+                        except Exception as e:
+                            tool_out = {"error": str(e)}
+                            status = "failed"
+
+                    outputs.append({
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "status": status,
+                        "output": json.dumps(tool_out, ensure_ascii=False),
+                    })
+
+                resp = self.client.create(
+                    model=model,
+                    previous_response_id=resp.id,
+                    input=outputs,
+                )
+                assert isinstance(resp, ResponseObject)
+                rounds.append(resp)
+
+            return resp, rounds
+
+        # ------------------------------
+        # Mode B) chat/completions loop
+        # ------------------------------
+        if mode == "chat":
+            messages: List[Json] = []
+            if instructions:
+                messages.append({"role": "system", "content": instructions})
+            messages.append({"role": "user", "content": user_text})
+
+            resp = self.client.create_chat(
+                model=model,
+                messages=messages,
+                tools=tools_schema,
+                tool_choice=tool_choice,
+            )
+            rounds.append(resp)
+
+            for _ in range(max_rounds):
+                calls = self.client.find_tool_calls(resp)
+                if not calls:
+                    return resp, rounds
+
+                # Append assistant message (which contains tool_calls) back into the chat history
+                try:
+                    choices = resp.get("choices") if isinstance(resp, dict) else None
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        msg = choices[0].get("message")
+                        if isinstance(msg, dict):
+                            messages.append(cast(Json, msg))
+                except Exception:
+                    pass
+
+                for call in calls:
+                    target_name = call.name
+                    if not target_name and len(self.tool_impls) == 1:
+                        target_name = list(self.tool_impls.keys())[0]
+                        print(f"[ToolRunner] ⚠️ Warning: Received unnamed tool call. Auto-routing to '{target_name}'")
+
+                    fn = self.tool_impls.get(target_name)
+                    if fn is None:
+                        tool_out = {"error": f"Tool '{target_name}' not implemented."}
+                    else:
+                        try:
+                            tool_out = fn(call.arguments)
+                        except Exception as e:
+                            tool_out = {"error": str(e)}
+
+                    # role=tool message (OpenAI-compatible)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.call_id or "",
+                        "content": json.dumps(tool_out, ensure_ascii=False),
+                    })
+
+                resp = self.client.create_chat(
+                    model=model,
+                    messages=messages,
+                    tools=tools_schema,
+                    tool_choice=tool_choice,
+                )
+                rounds.append(resp)
+
+            return resp, rounds
+
+        raise ValueError("mode must be 'responses' or 'chat'")
