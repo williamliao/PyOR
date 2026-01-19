@@ -137,19 +137,26 @@ class MCPHttpConfig:
 
 
 class MCPHttpClient:
-    """Minimal MCP client over HTTP JSON-RPC."""
+    """Minimal MCP client over HTTP JSON-RPC.
+    
+    Updated: Added threading lock and strict param handling.
+    """
 
     def __init__(self, cfg: MCPHttpConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
         self.session = session or requests.Session()
         self._id = 0
-        self._session_id: Optional[str] = None  # Mcp-Session-Id
+        self._session_id: Optional[str] = None
         self._initialized: bool = False
         self._negotiated_protocol_version: Optional[str] = None
+        
+        # FIX 1: Add the missing lock
+        self._lock = threading.Lock()
 
     def _next_id(self) -> int:
-        self._id += 1
-        return self._id
+        with self._lock:
+            self._id += 1
+            return self._id
 
     def _post(self, payload: Json, *, allow_stream: bool = False) -> Tuple[Json, Dict[str, str]]:
         headers = {
@@ -177,12 +184,10 @@ class MCPHttpClient:
         r.encoding = "utf-8"
         resp_headers = {k: v for k, v in r.headers.items()}
 
-        # ✅ 先抓 session id（不管 SSE/JSON 都先做）
         sid = resp_headers.get("Mcp-Session-Id") or resp_headers.get("mcp-session-id")
         if sid:
             self._session_id = sid
 
-        # ✅ 不要 raise_for_status，改自己吐更清楚的錯誤
         if r.status_code < 200 or r.status_code >= 300:
             body_head = ""
             try:
@@ -195,12 +200,10 @@ class MCPHttpClient:
 
         ct = r.headers.get("content-type", "")
 
-        # ✅ SSE：用 iter_lines 拿 data:
         if _is_event_stream(ct):
             data = _parse_sse_first_jsonrpc(r)
             return data, resp_headers
 
-        # ✅ JSON
         try:
             return r.json(), resp_headers
         except Exception as e:
@@ -213,14 +216,7 @@ class MCPHttpClient:
                 f"Invalid JSON-RPC response (content-type={ct}): {e}; body_head={body_head}"
             ) from e
 
-
     def _ensure_initialized(self) -> None:
-        """Perform MCP initialization handshake if needed.
-
-        Many Streamable HTTP servers (including n8n MCP) require an Mcp-Session-Id
-        header on all requests after initialization; otherwise they respond 400.
-        The session id is typically returned in the initialize response headers.
-        """
         if self._initialized:
             return
 
@@ -232,7 +228,6 @@ class MCPHttpClient:
             "params": {
                 "protocolVersion": self.cfg.protocol_version,
                 "clientInfo": {"name": "ollama-mcp-adapter", "version": "0.1"},
-                # Minimal capabilities is fine for tool-only usage.
                 "capabilities": {"tools": {}},
             },
         }
@@ -241,17 +236,14 @@ class MCPHttpClient:
             raise MCPError(str(data["error"]))
         result = data.get("result", {})
 
-        # Negotiate protocol version if server echoes it
         if isinstance(result, dict) and isinstance(result.get("protocolVersion"), str):
             self._negotiated_protocol_version = result["protocolVersion"]
 
-        # Send notifications/initialized (JSON-RPC notification has no id)
         notif_payload = {
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
-            "params": {},
+            # Strict mode: no params for notifications if empty
         }
-        # Some servers respond with empty body for notifications; ignore JSON parse failures.
         try:
             self._post(notif_payload)
         except Exception:
@@ -260,6 +252,9 @@ class MCPHttpClient:
         self._initialized = True
 
     def call(self, method: str, params: Optional[Json] = None) -> Json:
+        if method != "initialize":
+            self._ensure_initialized()
+        
         req_id = self._next_id()
         payload = {
             "jsonrpc": "2.0",
@@ -267,48 +262,22 @@ class MCPHttpClient:
             "method": method,
         }
         
-        # ✅ FIX: Only add "params" key if params is not empty.
-        # This fixes the "Invalid request parameters" error (-32602).
+        # FIX 2: Only add 'params' if it exists (Same fix as Stdio)
         if params:
             payload["params"] = params
-
-        line = json.dumps(payload, ensure_ascii=False)
-
-        with self._lock:
-            assert self._proc.stdin is not None
-            assert self._proc.stdout is not None
-
-            self._proc.stdin.write(line + "\n")
-            self._proc.stdin.flush()
-
-            deadline = time.time() + self.cfg.timeout_s
-            while time.time() < deadline:
-                resp_line = self._proc.stdout.readline()
-                if not resp_line:
-                    # process exited?
-                    if self._proc.poll() is not None:
-                        raise MCPError("MCP stdio process exited")
-                    continue
-                resp_line = resp_line.strip()
-                if not resp_line:
-                    continue
-                try:
-                    data = json.loads(resp_line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict) and data.get("id") == req_id:
-                    if "error" in data:
-                        raise MCPError(str(data["error"]))
-                    return data.get("result", {})
-
-            raise MCPError(f"MCP stdio call timeout: {method}")
+            
+        data, _hdrs = self._post(payload)
+        if "error" in data:
+            raise MCPError(str(data["error"]))
+        return data.get("result", {})
 
     def tools_list(self) -> List[Json]:
         tools: List[Json] = []
         cursor: Optional[str] = None
         while True:
             params = {} if cursor is None else {"cursor": cursor}
-            result = self.call("tools/list", params if params is not None else {})
+            # call() will strip empty params automatically
+            result = self.call("tools/list", params)
             page = result.get("tools", [])
             if isinstance(page, list):
                 tools.extend([t for t in page if isinstance(t, dict)])
@@ -318,8 +287,7 @@ class MCPHttpClient:
         return tools
 
     def tools_call(self, name: str, arguments: Json) -> Json:
-        result = self.call("tools/call", {"name": name, "arguments": arguments or {}})
-        return result
+        return self.call("tools/call", {"name": name, "arguments": arguments or {}})
 
 
 # -----------------------------

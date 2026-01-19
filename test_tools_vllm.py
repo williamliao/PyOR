@@ -86,10 +86,10 @@ def extract_all_text(resp) -> str:
 
     return "\n".join(texts).strip()
 
-# --- 1) Open Responses client (Ollama) ---
+# --- 1) Open Responses client (vllm) ---
 client = OpenResponsesClient(
-    base_url="http://localhost:11434",
-    api_key="ollama",
+    base_url=os.getenv("VLLM_BASE_URL"),
+    api_key=os.getenv("VLLM_API_KEY"),
     timeout_s=300,
 )
 
@@ -109,7 +109,7 @@ runner = ToolRunner(
 
 
 # --- 3) Execution ---
-target_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+target_model = os.getenv("VLLM_MODEL"),
 
 tool_choice_policy = "auto"
 
